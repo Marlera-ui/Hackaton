@@ -1,0 +1,10 @@
+name: nosso_app
+title:
+username: joaomatheus
+account: joaomatheus
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 17457954
+bundleId:
+url: https://joaomatheus.shinyapps.io/nosso_app/
+version: 1
