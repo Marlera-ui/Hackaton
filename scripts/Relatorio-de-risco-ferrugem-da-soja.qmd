@@ -1,0 +1,1010 @@
+---
+title: "Relatório de Risco Agroclimático: Ferrugem Asiática da Soja"
+subtitle: "Análise de Impacto Fitossanitário e Atuarial em Minas Gerais"
+author: "Camila, João, Maria e Marlon"
+date: "2024-01-15"
+format:
+  html:
+    theme:
+      light: cosmo
+      dark: darkly
+    embed-resources: true
+    toc: true
+    toc-location: left
+    toc-title: "Sumário"
+    number-sections: false
+execute:
+  warning: false
+  message: false
+  cache: true
+editor_options: 
+  chunk_output_type: console
+---
+
+## Relatório de Risco Agroclimático: Ferrugem Asiática da Soja
+
+**Objetivo:** Este relatório apresenta a estimativa de risco de perda de produtividade na cultura da soja no estado de Minas Gerais, ocasionada pela doença denominada Ferrugem Asiática, causada pelo patógeno *Phakopsora pachyrhizi*.
+
+O modelo integra os dados de produtividade histórica extraídos via API do IBGE (SIDRA), precipitação diária via satélite (NASA POWER) e modelagem epidemiológica.
+
+### 1. Pacotes e Ferramentas Utilizadas
+
+PPara a construção deste modelo, utilizamos um conjunto de pacotes focados em manipulação de dados (`tidyverse`), acesso a APIs governamentais e espaciais (`sidrar`, `geobr`, `nasapower`) e renderização de mapas vetoriais (`sf`, `ggplot2`).
+
+```{r}
+
+# ============================================================
+# 1. PACOTES
+# ============================================================
+
+library(tidyverse)
+library(tidyr)
+library(sidrar)#
+library(geobr)#
+library(sf)#
+library(nasapower)
+library(janitor)
+library(lubridate)
+library(dplyr)#
+library(readxl)
+library(leaflet)
+library(scales)
+library(stringr)#
+library(ggplot2)#
+library(knitr)
+library(htmltools)
+
+```
+
+### 2. Delimitação da Área de Estudo
+
+Para otimizar o processamento e focar nas áreas de real interesse econômico, o primeiro passo consiste em mapear os municípios mineiros. Em seguida, extraímos os centróides geométricos de cada cidade, que servirão como as coordenadas exatas para a posterior requisição dos dados climáticos de satélite.
+
+```{r}
+# ============================================================
+# 2. MUNICÍPIOS DE MINAS GERAIS + COORDENADAS
+# ============================================================
+
+#mg_municipios <- read_municipality(code_muni = "MG",  year = 2020,  simplified = TRUE)
+
+#Para rodar no pc do joão
+mg_municipios <- readRDS("mg_municipios.rds")
+
+mg_centroides <- mg_municipios |>
+  st_centroid() |>
+  mutate(
+    longitude = st_coordinates(geom)[, 1],
+    latitude  = st_coordinates(geom)[, 2]
+  ) |>
+  st_drop_geometry() |>
+  select(
+    cod_ibge = code_muni,
+    municipio = name_muni,
+    longitude,
+    latitude
+  )
+
+# 3. Desenhar um mapa simples na tela apenas para confirmar que os dados vieram certos
+ggplot(data = mg_municipios) +
+  geom_sf(fill = "#E0E0E0", color = "#505050", size = 0.1) +
+  theme_minimal() +
+  labs(
+    title = "Mapa Base: Minas Gerais",
+    subtitle = "Fronteiras dos 853 municípios baixadas com sucesso"
+  )
+
+head(mg_centroides)
+
+```
+
+### 3. Produtividade Potencial (IBGE/SIDRA)
+
+Com o objeto de observar o potencial produtivo de cada região, nós realizamos uma requisição direta à Tabela 1612 (Produção Agrícola Municipal - PAM) do Sistema IBGE de Recuperação Automática (SIDRA). Filtramos especificamente a cultura da soja para calcular a produtividade máxima e média de cada município entre 2022 e 2024.
+
+Desta forma, é possível utilizar os dados de produção para calcular qual a proporção do impacto que os riscos das perdas pela doença pode tomar.
+
+```{r}
+# ============================================================
+# 3. PRODUTIVIDADE DE SOJA - SIDRA/IBGE
+# Tabela 1612: Produção Agrícola Municipal
+# ============================================================
+
+# 1. Puxando os anos reais disponíveis no IBGE (2022 a 2024)
+dados_sidra <- get_sidra(
+  x = 1612,                
+  variable = 112,          
+  classific = "c81",       
+  category = list(2713),   
+  geo = "City",            
+  geo.filter = list("State" = 31),
+  period = c("2022", "2023", "2024") 
+)
+
+# 2. Limpeza, filtro e cálculo da MÁXIMA e da MÉDIA com o |>
+produtividade_soja <- dados_sidra |>
+  select(
+    codigo_ibge = `Município (Código)`,
+    municipio = `Município`,
+    rendimento_kg_ha = `Valor`
+  ) |>
+  mutate(
+    codigo_ibge = as.numeric(codigo_ibge),
+    rendimento_kg_ha = as.numeric(rendimento_kg_ha)
+  ) |>
+  # Remove os municípios que não tiveram produção (valores NA)
+  filter(!is.na(rendimento_kg_ha)) |> 
+  
+  # Agrupa por cidade para fazer as contas
+  group_by(codigo_ibge, municipio) |>
+  summarise(
+    prod_maxima = max(rendimento_kg_ha, na.rm = TRUE),
+    prod_media = mean(rendimento_kg_ha, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  # Prepara o código de 6 dígitos para o mapa depois
+  mutate(code_muni_6d = str_sub(as.character(codigo_ibge), 1, 6))
+
+# Mostra o resultado final
+head(produtividade_soja)
+
+```
+
+### 4. Aquisição de Dados Climáticos (NASA POWER)
+
+Com os municípios produtores de soja mapeados, buscamos dados de interesse na API da NASA POWER. O algoritmo busca dados pluviométricos de cada cidade produtora, baixando o volume diário de precipitação (`PRECTOTCORR`) para o período da safra.
+
+Essa base consolidada de dados é salva localmente para viabilizar cálculos dinâmicos de janelas de chuva.
+
+```{r}
+# ============================================================
+# Passo 3 (Ajustado): Baixar a SAFRA INTEIRA da NASA 
+# (Para permitir a escolha dos 30 dias dinamicamente depois)
+# ============================================================
+
+cidades_alvo <- mg_centroides |>
+  # Se a coluna chamar cod_ibge, codigo_ibge, etc., ele converte para code_muni
+  rename_with(~"code_muni", any_of(c("cod_ibge", "codigo_ibge", "code_municipio", "code_muni"))) |>
+  # O mesmo para o nome da cidade
+  rename_with(~"name_muni", any_of(c("municipio", "nome_muni", "name_muni", "nome_municipio"))) |>
+  
+  # Agora sim, faz o filtro com segurança
+  filter(code_muni %in% produtividade_soja$codigo_ibge)
+
+total_cidades <- nrow(cidades_alvo)
+lista_clima <- list()
+
+
+# 2. O Loop de Download
+for (i in 1:total_cidades) {
+  
+  cidade_atual <- cidades_alvo[i, ]
+  message(paste0("[", i, "/", total_cidades, "] Baixando clima de: ", cidade_atual$name_muni))
+  
+  dados_nasa <- tryCatch({
+    get_power(
+      community = "ag",
+      lonlat = c(cidade_atual$longitude, cidade_atual$latitude),
+      pars = "PRECTOTCORR", 
+      dates = c("2023-11-01", "2024-03-31"), # Safra inteira
+      temporal_api = "daily"
+    )
+  }, error = function(e) { return(NULL) })
+  
+  if (!is.null(dados_nasa)) {
+    # Salva o arquivo diário
+    lista_clima[[i]] <- dados_nasa |>
+      select(YEAR, MM, DD, YYYYMMDD, PRECTOTCORR) |>
+      mutate(
+        codigo_ibge = cidade_atual$code_muni,
+        municipio = cidade_atual$name_muni
+      )
+  }
+}
+
+# 3. Junta tudo e salva no HD
+clima_diario_mg <- do.call(rbind, lista_clima)
+saveRDS(clima_diario_mg, "clima_nasa_diario_safra2324.rds")
+
+# Só para ggarantir que a base de dados climáticos foi salva:
+getwd()
+```
+
+### 5. Modelagem do Risco Agrícola (Equação BR3)
+
+Após o registro do foco da doença, calcula-se a chuva acumulada ($R$) nos 30 dias seguintes. Essa variável climática alimenta o modelo empírico BR3 de Del Ponte para estimar a Severidade ($S$) da doença:
+
+\$\$S = -3.8983 + 0.3777R - 0.0003R\^2\$\$
+
+A severidade percentual é então convertida em Perda de Produtividade (kg/ha) multiplicando a produtividade máxima local por um coeficiente de dano fenológico ($c$), assumido neste modelo base como o valor **0,74.**
+
+Na fitopatologia, o **coeficiente de Dano fenológico (**$c$**)** representa a taxa de redução na produtividade de grãos para cada 1% de incremento na severidade máxima da doença na área foliar. A escolha do valor **0,74** como parâmetro fixo para este modelo base fundamenta-se em três pilares:
+
+1.  **Parametrização pelo Pior Cenário Epidemiológico:** O estudo de meta-análise determinou que o coeficiente global médio de dano da ferrugem asiática é de 0,60 (ou seja, 0,60 pontos percentuais de perda para cada 1% de severidade foliar). No entanto, os autores demonstraram que o momento do início da epidemia altera drasticamente esse impacto. Quando a infecção ocorre de forma precoce — **antes do florescimento da cultura** —, o coeficiente de dano relativo salta para **0,74 pp/%**. Adotar o valor de 0,74 permite à seguradora calcular o risco com base no cenário de maior vulnerabilidade biológica da planta.
+
+2.  **Dinâmica de Quebra do Teto Produtivo:** Estatisticamente, sob o coeficiente de 0,74, o modelo assume que uma epidemia que atinja uma severidade média de 27% na área foliar será responsável por uma perda direta de **20 pontos percentuais** na produtividade atingível ($Y_{max}$) daquele município. Essa correlação matemática mimetiza com precisão o dano fisiológico causado pelo fungo *Phakopsora pachyrhizi*, que provoca a desfolha precoce da soja e impede o enchimento e o ganho de peso dos grãos.
+
+3.  **Prudência Atuarial para a Seguradora (Margem de Segurança):** Para a gestão de fundos de uma seguradora de risco agroclimático, o princípio da prudência exige que o provisionamento financeiro seja capaz de suportar anos de alta pressão fitossanitária. Utilizar o coeficiente de 0,74 garante que a projeção de indenizações não seja subestimada, blindando a instituição contra a insolvência em safras onde a doença apareça mais cedo no campo, ao mesmo tempo em que mantém o modelo matemático simplificado e viável para rodar via dados de satélite no MVP.
+
+**Justificativa para a escolha do Modelo BR3:**
+
+A escolha do modelo epidemiológico é um ponto crítico para a confiabilidade do relatório de risco. Neste projeto, adotamos a **Equação BR3 do modelo de Del Ponte *et al*. (2006)** com base nos seguintes criterios:
+
+1.  **Calibração Nacional:** O modelo foi desenvolvido e validado utilizando dados reais de epidemias de ferrugem asiática em diversas regiões produtoras do Brasil, tornando-o biologicamente aderente à realidade fitossanitária de Minas Gerais.
+
+2.  **Viabilidade Tecnológica (Satelital):** Modelos preditivos puramente biológicos exigem dados de "Duração do Molhamento Foliar" (DMF) em escala horária. Obter a DMF por sensores remotos em tempo real é tecnicamente complexo e impreciso. O modelo BR3 contorna essa limitação ao demonstrar empiricamente que a **precipitação acumulada (**$R$) em uma janela de 30 dias é um excelente *proxy* (indicador indireto) para o molhamento foliar e para o sucesso da infecção dos esporos de *Phakopsora pachyrhizi*.
+
+3.  **Comportamento Parabólico Biológico:** A equação possui um termo quadrático negativo ($-0.0003R^2$). Isso reflete com precisão o comportamento biológico da doença: a chuva estimula o fungo até certo ponto (dispersão e umidade), mas precipitações torrenciais excessivas "lavam" os esporos das folhas, reduzindo a taxa de infecção real, dinâmica que este modelo captura perfeitamente.
+
+A equação preditiva da Severidade máxima esperada ($S$) é expressa por:
+
+\$\$S = -3.8983 + 0.3777R - 0.0003R\^2\$\$
+
+Para a conversão da severidade foliar em perda econômica real (kg/ha), aplicamos o conceito de **Função de Dano (Yield Loss Function)** baseado nos históricos da literatura brasileira (GODOY, 2012). Adotou-se o coeficiente de dano médio ($c$) de **0.74**, o que significa que para cada 1% de área foliar severamente afetada pela doença, estima-se uma perda de 0,74% do teto produtivo local ($Y_{max}$):
+
+\$\$\\text{Perda (kg/ha)} = Y\_{max} \\times \\left( c \\times \\frac{S}{100} \\right)\$\$
+
+```{r}
+# ============================================================
+# Passo 4: A Matemática da Seguradora (Calculando o Risco)
+# ============================================================
+
+# 1. Carrega os dados abrindo uma janela (clique no seu arquivo .rds!)
+clima_diario_mg <- readRDS(file.choose())
+
+# 2. O seu Input de Data
+data_foco <- as.Date("2024-01-15")
+data_limite <- data_foco + 30 
+
+# 3. Recorta os 30 dias e soma a chuva
+chuva_30dias <- clima_diario_mg |>
+  # CORREÇÃO AQUI: Usa a data direto, sem inventar moda com o formato!
+  mutate(data_real = as.Date(YYYYMMDD)) |>
+  filter(data_real >= data_foco & data_real <= data_limite) |>
+  group_by(codigo_ibge) |> 
+  summarise(chuva_acumulada = sum(PRECTOTCORR, na.rm = TRUE), .groups = "drop")
+
+# 4. A Fusão e a Matemática
+tabela_risco_seguradora <- produtividade_soja |>
+  inner_join(chuva_30dias, by = "codigo_ibge") |>
+  mutate(
+    sev_calculada = -3.8983 + (0.3777 * chuva_acumulada) - (0.0003 * (chuva_acumulada^2)),
+    severidade_final_pct = pmax(0, pmin(100, sev_calculada)),
+    coeficiente_dano = 0.74,
+    perda_kg_ha = prod_maxima * (coeficiente_dano * (severidade_final_pct / 100))
+  )
+
+# 5. O Resultado
+tabela_risco_seguradora |>
+  arrange(desc(perda_kg_ha)) |>
+  select(municipio, chuva_acumulada, severidade_final_pct, perda_kg_ha) |>
+  head(10)
+
+```
+
+### 6. Mapa de Calor
+
+Nesta etapa, buscamos ilustrar as informações referentes ao risco de prejuizo de cada município em um gráfico no formato de mapa de calor. Os municípios produtores são coloridos sob um gradiente térmico de risco, permitindo rápida visualização das áreas críticas para o dimensionamento de sinistros.
+
+```{r}
+
+# ============================================================
+# Passo 5: O Mapa de Risco de Prejuízo (Gradiente)
+# ============================================================
+
+
+# 1. Recarregando as fronteiras de Minas Gerais (Polígonos completos)
+# Usamos showProgress = FALSE para não poluir o console
+#mapa_mg_poligonos <- read_municipality(code_muni = "MG", year = 2020, showProgress = FALSE)
+
+#Para rodar no pc do João
+mapa_mg_poligonos <- readRDS("mg_municipios.rds")
+
+# 2. Unindo o mapa geográfico com a nossa Tabela de Risco
+mapa_risco <- mapa_mg_poligonos |>
+  # Converte o código para número para o cruzamento bater perfeitamente
+  mutate(code_muni = as.numeric(code_muni)) |>
+  # left_join mantém o mapa inteiro de MG e anexa o risco só onde tem soja
+  left_join(tabela_risco_seguradora, by = c("code_muni" = "codigo_ibge"))
+
+# 3. Desenhando o Mapa com o Gradiente
+ggplot(data = mapa_risco) +
+  # Desenha os municípios e pinta de acordo com a coluna perda_kg_ha
+  geom_sf(aes(fill = perda_kg_ha), color = "gray80", size = 0.1) +
+  
+  # Aplica o gradiente: Amarelo (Baixo) -> Laranja -> Vermelho (Alto)
+  # na.value pinta as cidades sem soja de cinza
+  scale_fill_distiller(
+    palette = "YlOrRd", 
+    direction = 1, 
+    na.value = "gray95",
+    name = "Prejuízo Estimado\n(kg/ha)"
+  ) +
+  
+  # Deixa o fundo do gráfico limpo e elegante
+  theme_void() +
+  
+  # Adiciona os títulos
+  labs(
+    title = "Mapa de Risco: Ferrugem Asiática da Soja em MG",
+    subtitle = paste("Projeção de impacto 30 dias após o foco em", format(data_foco, "%d/%m/%Y")),
+    caption = "Elaboração própria | Dados: NASA POWER e IBGE PAM\nCidades em cinza não possuem produção de soja registrada."
+  ) +
+  
+  # Ajustes de texto e posição da legenda
+  theme(
+    legend.position = "right",
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5, color = "gray30"),
+    plot.caption = element_text(size = 9, color = "gray50")
+  )
+
+```
+
+### 7. Ranking dos municípios de maior risco
+
+A partir das informações visuais do gráfico, podemos listar o nome dos municípios com maior risco de prejuízo e o valor da redução produtiva (kg/ha).
+
+```{r}
+# ============================================================
+# Passo 6: Gerando a Tabela do Ranking dos Municípios de maior risco
+# ============================================================
+
+tabela_ranking_completa <- mapa_risco |>
+  # 1. Transforma o objeto sf em uma tabela comum
+  sf::st_drop_geometry() |>
+  
+  # 2. Remove os municípios que não têm produção de soja registrada (valores NA) 
+  filter(!is.na(perda_kg_ha)) |>
+  
+  # 3. Calcula o valor da redução produtiva em porcentagem
+  mutate(reducao_produtiva_pct = (perda_kg_ha / prod_maxima) * 100) |>
+  
+  # 4. AJUSTADO: Seleciona as colunas solicitadas para a comparação 
+  select(name_muni, prod_maxima, perda_kg_ha, reducao_produtiva_pct) |>
+  
+  # 5. Remove duplicatas para garantir uma linha por município 
+  distinct(name_muni, .keep_all = TRUE) |>
+  
+  # 6. Mantém a ordenação do maior prejuízo estimado para o menor 
+  arrange(desc(perda_kg_ha)) |>
+  
+  # 7. Arredonda os valores para garantir uma leitura científica limpa
+  mutate(
+    prod_maxima = round(prod_maxima, 1),
+    perda_kg_ha = round(perda_kg_ha, 1),
+    reducao_produtiva_pct = round(reducao_produtiva_pct, 2)
+  ) |>
+  
+  # 8. Renomeia as colunas para a apresentação final 
+  rename(
+    `Município` = name_muni,
+    `Produtividade Potencial (kg/ha)` = prod_maxima,
+    `Prejuízo Estimado (kg/ha)` = perda_kg_ha,
+    `Redução Produtiva (%)` = reducao_produtiva_pct
+  )
+
+# ------------------------------------------------------------
+# Visualizando o resultado 
+# ------------------------------------------------------------
+
+# Exibe as 20 primeiras linhas no console para conferência rápida
+head(tabela_ranking_completa, 20)
+
+# Para exibir uma tabela bonita em relatórios automatizados:
+knitr::kable(tabela_ranking_completa, caption = "Análise Geral Comparativa de Perda e Redução Produtiva de Soja em MG por Município")
+
+```
+
+Ordenação da tabela por municípios de maior relevância produtiva.
+
+```{r}
+# 1. Puxando as duas variáveis da PAM/IBGE (2022 a 2024)
+dados_sidra <- get_sidra(
+  x = 1612,                
+  variable = c(214, 112),  # 214 = Área plantada (ha), 112 = Rendimento (kg/ha)
+  classific = "c81",       
+  category = list(2713),   
+  geo = "City",            
+  geo.filter = list("State" = 31),
+  period = c("2022", "2023", "2024") 
+)
+
+# 2. Limpeza, filtro e pivonagem dos dados 
+produtividade_soja <- dados_sidra |>
+  filter(!is.na(Valor)) |>
+  mutate(
+    codigo_ibge = as.numeric(`Município (Código)`),
+    var_codigo = `Variável (Código)`,
+    Valor = as.numeric(Valor)
+  ) |>
+  # Agrupa para coletar o teto histórico recente de cada variável por município
+  group_by(codigo_ibge, municipio = `Município`, var_codigo) |>
+  summarise(valor_max = max(Valor, na.rm = TRUE), .groups = "drop") |>
+  
+  # Transforma os códigos das variáveis em colunas distintas
+  pivot_wider(names_from = var_codigo, values_from = valor_max) |>
+  
+  # Renomeia usando os códigos oficiais do SIDRA de forma explícita
+  rename(
+    area_plantada_ha = `214`,
+    prod_maxima = `112`
+  ) |>
+  # Garante que apenas municípios com dados completos permaneçam
+  filter(!is.na(prod_maxima) & !is.na(area_plantada_ha)) |>
+  mutate(code_muni_6d = str_sub(as.character(codigo_ibge), 1, 6))
+
+# Mostra a estrutura corrigida para conferência
+head(produtividade_soja)
+
+# Matriz de Risco e Relevância Agrícola ordenado pelo impacto total e volume de área exposta
+
+# 1. Baixa a Área Plantada (Variável 214) do IBGE de forma independente
+area_soja_sidra <- get_sidra(
+  x = 1612,                
+  variable = 214,          # 214 = Área plantada (ha) oficial da PAM/IBGE
+  classific = "c81",       
+  category = list(2713),   
+  geo = "City",            
+  geo.filter = list("State" = 31),
+  period = c("2022", "2023", "2024") 
+) |>
+  filter(!is.na(Valor)) |>
+  mutate(
+    codigo_ibge = as.numeric(`Município (Código)`),
+    Valor = as.numeric(Valor)
+  ) |>
+  group_by(codigo_ibge) |>
+  summarise(area_plantada_ha = max(Valor, na.rm = TRUE), .groups = "drop")
+
+# 2. Gera o Ranking acoplando a área diretamente ao seu mapa_risco atual
+tabela_ranking_relevancia <- mapa_risco |>
+  # Remove a parte geométrica espacial para transformar em tabela comum
+  sf::st_drop_geometry() |>
+  
+  # Filtra os municípios que possuem o cálculo de perda
+  filter(!is.na(perda_kg_ha)) |>
+  
+  # SOLUÇÃO DO ERRO: Injeta a coluna de área plantada usando o código do município
+  left_join(area_soja_sidra, by = c("code_muni" = "codigo_ibge")) |>
+  
+  # Garante que municípios sem registro de área sejam desconsiderados
+  filter(!is.na(area_plantada_ha)) |>
+  
+  # 3. NOVAS MÉTRICAS: Porcentagem de perda e Impacto Macro Absoluto
+  mutate(
+    reducao_produtiva_pct = (perda_kg_ha / prod_maxima) * 100,
+    # Conta: (Área em ha * Perda em kg/ha) / 1000 = Perda total em Toneladas (t)
+    prejuizo_total_toneladas = (area_plantada_ha * perda_kg_ha) / 1000
+  ) |>
+  
+  # 4. Seleção estruturada das colunas de interesse para o relatório
+  select(
+    name_muni, 
+    area_plantada_ha, 
+    prod_maxima, 
+    perda_kg_ha, 
+    reducao_produtiva_pct, 
+    prejuizo_total_toneladas
+  ) |>
+  
+  distinct(name_muni, .keep_all = TRUE) |>
+  
+  # 5. ORDENAÇÃO: Maiores áreas com maiores riscos no topo (Perda em Toneladas)
+  arrange(desc(prejuizo_total_toneladas)) |>
+  
+  # 6. Formatação de casas decimais para padrão científico limpo
+  mutate(
+    area_plantada_ha = round(area_plantada_ha, 0),
+    prod_maxima = round(prod_maxima, 0),
+    perda_kg_ha = round(perda_kg_ha, 1),
+    reducao_produtiva_pct = round(reducao_produtiva_pct, 2),
+    prejuizo_total_toneladas = round(prejuizo_total_toneladas, 1)
+  ) |>
+  
+  # 7. Nomeação profissional das colunas para saída no PDF do Quarto
+  rename(
+    `Município` = name_muni,
+    `Área Plantada (ha)` = area_plantada_ha,
+    `Produtividade Potencial (kg/ha)` = prod_maxima,
+    `Prejuízo Estimado (kg/ha)` = perda_kg_ha,
+    `Redução Produtiva (%)` = reducao_produtiva_pct,
+    `Prejuízo Total (t)` =  prejuizo_total_toneladas
+  )
+
+# ------------------------------------------------------------
+# Renderizando a Tabela Completa no Relatório
+# ------------------------------------------------------------
+
+# Exibe prévia das primeiras linhas no console para verificação rápida
+head(tabela_ranking_relevancia, 20)
+
+# Renderiza a tabela de todas as cidades produtoras de forma organizada no PDF
+knitr::kable(
+  tabela_ranking_relevancia, 
+  caption = "Matriz de Vulnerabilidade Econômica: Municípios de MG Ordenados pelo Impacto Volumétrico Total do Risco"
+)
+
+```
+
+### 8. Estimativa de perdas potenciais
+
+A abordagem econômica ideal para este caso é a **Análise de Perda de Receita Bruta Direta (Gross Revenue Loss)**. Na comercialização da soja, os preços regionais em Minas Gerais (como nas praças de Unaí e Uberaba) são formados pela paridade de exportação, que depende diretamente de três fatores: a cotação na Bolsa de Chicago (CBOT), o prêmio de porto e a **cotação do dólar (câmbio)**. Portanto, mesmo que o produtor receba em Reais, a flutuação cambial dita o valor da saca. Vamos adotar como premissas os valores de referência atuais de mercado para a safra:
+
+-   **Preço da Saca de Soja (60 kg) em MG:** R\$ 142,00 (valor médio regional praticado).
+
+-   **Cotação do Dólar (USD/BRL):** R\$ 5,15.
+
+```{r}
+# 1. Busca a Área Plantada (Variável 214) do IBGE de forma independente
+area_soja_sidra <- get_sidra(
+  x = 1612,                
+  variable = 214,          # 214 = Área plantada (ha) oficial da PAM/IBGE
+  classific = "c81",       
+  category = list(2713),   
+  geo = "City",            
+  geo.filter = list("State" = 31),
+  period = c("2022", "2023", "2024") 
+) |>
+  filter(!is.na(Valor)) |>
+  mutate(
+    codigo_ibge = as.numeric(`Município (Código)`),
+    Valor = as.numeric(Valor)
+  ) |>
+  group_by(codigo_ibge) |>
+  summarise(area_plantada_ha = max(Valor, na.rm = TRUE), .groups = "drop")
+
+
+# 2. Parâmetros macroeconômicos de mercado
+PRECO_SACA_BRL <- 142.00  # Preço de referência da saca de 60kg em Minas Gerais
+COTACAO_DOLAR  <- 5.15    # Taxa de câmbio nominal (USD/BRL)
+
+
+# 3. Modelagem e Cálculo da Perda Financeira
+tabela_perda_financeira <- mapa_risco |>
+  # Remove a componente espacial para acelerar o processamento da tabela
+  sf::st_drop_geometry() |>
+  
+  # Filtra apenas os municípios que possuem cálculo de perda física
+  filter(!is.na(perda_kg_ha)) |>
+  
+  # Injeta a coluna de área plantada usando o código do município
+  left_join(area_soja_sidra, by = c("code_muni" = "codigo_ibge")) |>
+  
+  # Garante que municípios sem registro de área sejam desconsiderados
+  filter(!is.na(area_plantada_ha)) |>
+  
+  # Modelagem financeira macroeconômica
+  mutate(
+    # Perda total absoluta em sacas comerciais de 60kg
+    perda_total_sacas = (area_plantada_ha * perda_kg_ha) / 60,
+    
+    # Custo local individualizado por unidade de área (R$/ha) - Visão do Produtor
+    prejuizo_brl_ha = (perda_kg_ha / 60) * PRECO_SACA_BRL,
+    
+    # Prejuízo Total do município em Reais (DIVIDIDO POR 1 MILHÃO)
+    prejuizo_total_milhoes_brl = (perda_total_sacas * PRECO_SACA_BRL) / 1000000,
+    
+    # Prejuízo Total do município em Dólares (DIVIDIDO POR 1 MILHÃO)
+    prejuizo_total_milhoes_usd = (prejuizo_total_milhoes_brl / COTACAO_DOLAR)
+  ) |>
+  
+  # Seleção rigorosa das colunas na ordem exata de exibição
+ select(
+    name_muni, 
+    area_plantada_ha, 
+    perda_total_sacas, 
+    prejuizo_brl_ha, 
+    prejuizo_total_milhoes_brl, 
+    prejuizo_total_milhoes_usd
+  ) |>
+  
+  # 2. Elimina eventuais duplicatas de linhas por município
+  distinct(name_muni, .keep_all = TRUE) |>
+  
+  # 3. Ordenação decrescente pelo impacto financeiro total em Reais (R$)
+  arrange(desc(prejuizo_total_milhoes_brl)) |>
+  
+  # 4. Formatação profissional de casas decimais para relatórios econômicos
+  mutate(
+    area_plantada_ha = round(area_plantada_ha, 0),
+    perda_total_sacas = round(perda_total_sacas, 0),
+    prejuizo_brl_ha = round(prejuizo_brl_ha, 2),
+    prejuizo_total_milhoes_brl = round(prejuizo_total_milhoes_brl, 2),
+    prejuizo_total_milhoes_usd = round(prejuizo_total_milhoes_usd, 2)
+  )
+
+# ============================================================
+# Renderizando o Resultado 
+# ============================================================
+
+nomes_cabecalho <- c(
+  "Município",
+  "Área Plantada<br>(ha)",
+  "Perda Total<br>(Sacas)",
+  "Custo Local<br>(R$/ha)",
+  "Prejuízo Total<br>(Milhões R$)",
+  "Prejuízo Total<br>(Milhões US$)"
+)
+
+knitr::kable(
+  tabela_perda_financeira, 
+  format = "html",                           
+  align = c("l", "r", "r", "r", "r", "r"),   
+  col.names = nomes_cabecalho,               
+  escape = FALSE,                            
+  format.args = list(big.mark = ".", decimal.mark = ","),
+  caption = "Matriz de Impacto Financeiro Macro: Prejuízo Estimado da Soja em MG por Município"
+)
+
+```
+
+### 9. Visualização espacial do impacto econômico
+
+```{r}
+# ============================================================
+# Passo 9: Mapa Interativo de Risco e Impacto Financeiro
+# ============================================================
+
+# 1. Busca a Área Plantada (Variável 214) do IBGE de forma independente para segurança do pipeline
+area_soja_sidra <- get_sidra(
+  x = 1612,                
+  variable = 214,          
+  classific = "c81",       
+  category = list(2713),   
+  geo = "City",            
+  geo.filter = list("State" = 31),
+  period = c("2022", "2023", "2024") 
+) |>
+  filter(!is.na(Valor)) |>
+  mutate(
+    codigo_ibge = as.numeric(`Município (Código)`),
+    Valor = as.numeric(Valor)
+  ) |>
+  group_by(codigo_ibge) |>
+  summarise(area_plantada_ha = max(Valor, na.rm = TRUE), .groups = "drop")
+
+# 2. Parâmetros de Mercado
+PRECO_SACA_BRL <- 142.00
+
+# 3. Cruzamento Geográfico e Econômico (Garantindo o mapa completo de MG)
+mapa_interativo_dados <- mapa_mg_poligonos |>
+  mutate(code_muni = as.numeric(code_muni)) |>
+  
+  # left_join a partir de todos os municípios de MG garante que os não produtores permaneçam no mapa
+  left_join(tabela_risco_seguradora, by = c("code_muni" = "codigo_ibge")) |>
+  left_join(area_soja_sidra, by = c("code_muni" = "codigo_ibge")) |>
+  
+  # Estruturação e cálculo das variáveis solicitadas
+  mutate(
+    # Caso não seja produtor (NA), mantemos zerado/vazio para o cálculo não quebrar
+    perda_total_sacas = ifelse(is.na(perda_kg_ha), 0, (area_plantada_ha * perda_kg_ha) / 60),
+    prejuizo_total_milhoes_brl = (perda_total_sacas * PRECO_SACA_BRL) / 1000000
+  ) |>
+  
+  # Arredondamento rigoroso das 5 informações do Popup
+  mutate(
+    area_plantada_ha = round(area_plantada_ha, 0),
+    prod_maxima = round(prod_maxima, 0),
+    perda_kg_ha = round(perda_kg_ha, 1),
+    prejuizo_total_milhoes_brl = round(prejuizo_total_milhoes_brl, 2)
+  ) |>
+  
+  # Conversão de coordenadas e simplificação geométrica para desempenho
+  st_transform(crs = 4326) |>
+  st_simplify(preserveTopology = TRUE, dTolerance = 0.001)
+
+# 4. Paleta de Cores (Ignora os valores NA para pintar os não produtores em cinza depois)
+paleta_cores <- colorNumeric(
+  palette = "YlOrRd",
+  domain = mapa_interativo_dados$prejuizo_total_milhoes_brl,
+  na.color = "#EAEAEA" # Define a cor Cinza Claro explicitamente para os não produtores
+)
+
+# 5. Construção Inteligente dos Popups (Tratamento condicional para produtores vs não produtores)
+labels_mapa <- sprintf(
+  "<strong>Município:</strong> %s<br/>
+   %s",
+  mapa_interativo_dados$name_muni,
+  ifelse(
+    is.na(mapa_interativo_dados$perda_kg_ha),
+    "<span style='color: #777777;'>Sem produção de soja registrada</span>",
+    sprintf(
+      "<strong>Área Plantada:</strong> %s ha<br/>
+       <strong>Produtividade Potencial:</strong> %s kg/ha<br/>
+       <strong>Perda Estimada:</strong> %s kg/ha<br/>
+       <strong>Prejuízo Estimado:</strong> R$ %s Milhões",
+      format(mapa_interativo_dados$area_plantada_ha, big.mark = "."),
+      format(mapa_interativo_dados$prod_maxima, big.mark = "."),
+      format(mapa_interativo_dados$perda_kg_ha, decimal.mark = ","),
+      format(mapa_interativo_dados$prejuizo_total_milhoes_brl, decimal.mark = ",")
+    )
+  )
+) |> lapply(htmltools::HTML)
+
+# 6. Renderização do Mapa Restrito
+mapa_final <- leaflet(data = mapa_interativo_dados) |>
+  # Fundo minimalista para destacar o estado de Minas Gerais
+  addProviderTiles(providers$CartoDB.PositronNoLabels) |>
+  
+  # Desenha os polígonos com as regras solicitadas
+  addPolygons(
+    fillColor = ~paleta_cores(prejuizo_total_milhoes_brl),
+    weight = 0.8,
+    opacity = 1,
+    color = "#C0C0C0",     # Linha divisória fina em cinza médio
+    fillOpacity = 0.85,    # Opacidade balanceada
+    
+    # Efeito visual realçado ao passar o mouse
+    highlightOptions = highlightOptions(
+      weight = 2.5,
+      color = "#444444",
+      fillOpacity = 0.95,
+      bringToFront = TRUE
+    ),
+    label = labels_mapa,
+    labelOptions = labelOptions(
+      style = list("font-weight" = "normal", padding = "6px 10px"),
+      textsize = "13px",
+      direction = "auto"
+    )
+  ) |>
+  
+  # Legenda financeira (filtrando apenas valores válidos maiores que zero para não poluir)
+  addLegend(
+    pal = paleta_cores, 
+    values = mapa_interativo_dados$prejuizo_total_milhoes_brl, 
+    opacity = 0.7, 
+    title = "Prejuízo (Milhões R$)",
+    position = "bottomright"
+  )
+
+# Renderiza o mapa interativo
+mapa_final
+
+```
+
+### 10. Matriz de seguro
+
+Para precificar o seguro de um município, não basta cobrar do produtor o valor exato do prejuízo estimado, pois a seguradora quebraria (ou o seguro ficaria caro demais). Precisamos aplicar a **Matemática Atuarial**, que dilui o risco no tempo e adiciona as margens de operação da seguradora.
+
+**1. Fundamentação Atuarial**
+
+Para calcular o **Prêmio Comercial** (o valor que o produtor paga por hectare), devemos considerar as seguintes escolhas atuariais baseadas no mercado brasileiro de seguro rural (safra 2025/2026):
+
+1.  **Importância Segurada (IS):** O seguro não cobre a expectativa de lucro, mas sim o *custo de implantação da lavoura*. Vamos fixar a cobertura em **R\$ 6.000,00 por hectare** (valor médio para o Cerrado mineiro).
+
+2.  **Frequência do Sinistro (Probabilidade):** O seu modelo simulou o *pior cenário* (o foco da doença e 30 dias de clima favorável). Historicamente, uma epidemia severa como essa ocorre a cada 5 anos. Logo, a probabilidade anual do evento é de **20%**.
+
+3.  **Taxa de Risco Puro:** É o dano real ponderado pelo tempo. Se o modelo diz que a cidade perde 15% da produtividade, a taxa pura é: `15% * 20% (probabilidade) = 3,0%` ao ano.
+
+4.  **Carregamento Comercial:** A seguradora precisa pagar corretagem, impostos (IOF), custos operacionais, formar margem de segurança (resseguro) e ter lucro. Vamos aplicar um carregamento comercial padrão de **40%** (fator multiplicador de `1.4` sobre a Taxa de Risco Puro).
+
+**2. Matriz de Precificação Comercial (Tabela da Seguradora)**
+
+A partir da **Redução Produtiva Esperada (%)** calculada pelo seu modelo epidemiológico, os municípios mineiros são divididos em 5 classes tarifárias (do menor para o maior risco).
+
+|  |  |  |  |  |
+|----|----|----|----|----|
+| **Classe de Risco** | **Perda Biol. Simulada** | **Taxa Comercial Aplicada** | **Valor Cobrado do Produtor (Prêmio R\$/ha)** | **Exemplo de Perfil do Município** |
+| **I. Baixo Risco** | 0% a 5% | **Até 1,40%** | **R\$ 0 a R\$ 84,00** | Cidades secas / baixa pressão de doença. |
+| **II. Risco Moderado** | 5,1% a 10% | **1,41% a 2,80%** | **R\$ 85,00 a R\$ 168,00** | Risco aceitável. Maior volume de apólices vendidas. |
+| **III. Risco Alto** | 10,1% a 15% | **2,81% a 4,20%** | **R\$ 169,00 a R\$ 252,00** | Regiões favoráveis ao fungo. Exige vistoria prévia. |
+| **IV. Muito Alto** | 15,1% a 20% | **4,21% a 5,60%** | **R\$ 253,00 a R\$ 336,00** | Foco intenso. Seguro caro. Exige pacote de fungicidas. |
+| **V. Risco Crítico** | Acima de 20% | **Acima de 5,60%** | **\> R\$ 336,00** | Aceitação restrita. A seguradora pode negar a apólice. |
+
+*(Nota: O Prêmio \[R\$/ha\] é resultado da Taxa Comercial multiplicada pela Importância Segurada de R\$ 6.000,00).*
+
+O script abaixo pega os dados espaciais do `mapa_risco` e processa exatamente a lógica atuarial descrita acima, classificando cada município, determinando a taxa e definindo qual o preço do seguro por hectare que o produtor daquela cidade terá que pagar.
+
+```{r}
+# 1. Premissas Atuariais (Podem ser alteradas conforme o produto da seguradora)
+IMPORTANCIA_SEGURADA_HA <- 6000.00  # Cobertura do custo de produção (R$/ha)
+PROB_OCORRENCIA_ANUAL   <- 0.20     # Frequência de epidemia a cada 5 anos (20%)
+FATOR_CARREGAMENTO      <- 1.40     # +40% para despesas operacionais, corretagem e lucro
+
+# 2. Construindo a Tabela do Departamento Comercial
+tabela_precificacao_seguro <- mapa_risco |>
+  sf::st_drop_geometry() |>
+  filter(!is.na(perda_kg_ha)) |>
+  
+  # A. Recupera a métrica base: a porcentagem de redução biológica
+  mutate(reducao_produtiva_pct = (perda_kg_ha / prod_maxima) * 100) |>
+  
+  # B. Classificação em Classes de Risco (Matriz de Consulta)
+  mutate(
+    classe_risco = case_when(
+      reducao_produtiva_pct <= 5.0  ~ "I. Baixo Risco",
+      reducao_produtiva_pct <= 10.0 ~ "II. Risco Moderado",
+      reducao_produtiva_pct <= 15.0 ~ "III. Risco Alto",
+      reducao_produtiva_pct <= 20.0 ~ "IV. Muito Alto",
+      TRUE                          ~ "V. Risco Crítico"
+    )
+  ) |>
+  
+  # C. Matemática Atuarial
+  mutate(
+    # Taxa de Risco Puro (A perda real diluída no tempo)
+    taxa_risco_puro_pct = reducao_produtiva_pct * PROB_OCORRENCIA_ANUAL,
+    
+    # Taxa Comercial Final (O percentual cobrado do produtor sobre o valor segurado)
+    taxa_comercial_pct = taxa_risco_puro_pct * FATOR_CARREGAMENTO,
+    
+    # Prêmio Comercial (R$/ha): O valor do "boleto" que o produtor vai pagar por hectare
+    premio_rs_ha = (taxa_comercial_pct / 100) * IMPORTANCIA_SEGURADA_HA
+  ) |>
+  
+  # D. Seleção e ordenação estratégica para o relatório
+  select(
+    name_muni,
+    classe_risco,
+    reducao_produtiva_pct,
+    taxa_comercial_pct,
+    premio_rs_ha
+  ) |>
+  distinct(name_muni, .keep_all = TRUE) |>
+  
+  # Ordenamos do seguro mais caro (pior risco) para o mais barato
+  arrange(desc(premio_rs_ha)) |>
+  
+  # E. Formatação limpa
+  mutate(
+    reducao_produtiva_pct = round(reducao_produtiva_pct, 1),
+    taxa_comercial_pct = round(taxa_comercial_pct, 2),
+    premio_rs_ha = round(premio_rs_ha, 2)
+  ) |>
+  rename(
+    `Município` = name_muni,
+    `Classe de Aceitação` = classe_risco,
+    `Perda Simulada (%)` = reducao_produtiva_pct,
+    `Taxa do Seguro (%)` = taxa_comercial_pct,
+    `Custo do Seguro (R$/ha)` = premio_rs_ha
+  )
+
+# ------------------------------------------------------------
+# Visualização da Tabela de Vendas
+# ------------------------------------------------------------
+
+# Renderiza a tabela comercial completa 
+knitr::kable(
+  tabela_precificacao_seguro, 
+  caption = "Tabela Comercial de Seguro Agrícola: Precificação Baseada em Risco Fitossanitário Ponderado (IS: R$ 6.000/ha)"
+)
+
+```
+
+### 11. Regulação de sinistro
+
+Para tornar o reembolso cientificamente justo, não podemos usar um fator de dano fixo. O impacto real da Ferrugem Asiática é intimamente ligado à fase de desenvolvimento da planta (fenologia) no dia em que a infecção começou.
+
+**1. A Lógica Agronômica e Atuarial do Reembolso**
+
+Se o fungo infecta a lavoura no início, o prejuízo é catastrófico; se infecta no final, o grão já está pronto e o dano é quase nulo. Vamos parametrizar o Coeficiente de Dano ($c$) em 2 janelas críticas:
+
+1.  **Precoce (Antes de R1):** O impacto é severo ($c = 0,74$).
+
+2.  **Tardio (Depois de R1):** O impacto é moderado ($c = 0,51$).
+
+**A Fórmula do Reembolso Individual**
+
+O cálculo do valor a ser pago ao produtor segue a equação:
+
+$$
+\text{Reembolso Total (R\$)} = \text{Área do Produtor (ha)} \times \left( \frac{\text{Perda Recalculada (kg/ha)}}{60} \right) \times \text{Preço Garantido da Saca (R\$)}
+$$
+
+(Nota: A perda é recalculada aplicando a Severidade Climática daquele município multiplicada pelo coeficiente $c$ da fenologia específica).
+
+O seguinte script servirá de base para retornar o valor a ser ressarcido ao produtor em caso de sinistro, que irá compor uma das abas do aplicativo que será desenvolvido, sendo necessária para sua utilização as seguintes informações: município do plantio, área plantada (ha) e estádio fenológico do plantio em que a infecção foi detectada.
+
+```{r}
+# ============================================================
+# Passo 11: Calculador de Reembolso de Sinistro Individual
+# ============================================================
+
+
+# Preço contratado na apólice de seguro para pagamento do sinistro
+PRECO_SACA_SEGURO <- 142.00 
+
+#' Função Atuarial para Calcular Indenização de Clientes
+#' @param municipio Nome exato do município cadastrado
+#' @param area_fazenda_ha Tamanho da área segurada em hectares
+#' @param fenologia_na_infeccao Estágio da planta ("Vegetativo", "Floração", "Enchimento", "Maturação")
+calcular_reembolso <- function(municipio, area_fazenda_ha, fenologia_na_infeccao) {
+  
+  # 1. Define o coeficiente de dano (c) com base na fenologia informada
+  coef_c <- case_when(
+    fenologia_na_infeccao == "Precoce" ~ 0.74,
+    fenologia_na_infeccao == "Tardio"   ~ 0.51,
+    TRUE                                  ~ 0.00
+  )
+  
+  # 2. Busca os dados climáticos e produtivos específicos daquela cidade no seu mapa_risco
+  dados_municipio <- mapa_risco |> 
+    sf::st_drop_geometry() |>
+    filter(tolower(name_muni) == tolower(municipio)) |>
+    distinct(name_muni, .keep_all = TRUE)
+  
+  # Validação caso o município digitado não exista ou não produza soja
+  if(nrow(dados_municipio) == 0) {
+    return(data.frame(Erro = "Município não encontrado ou sem histórico de soja."))
+  }
+  
+  # 3. Execução dos cálculos paramétricos por hectare
+  prod_esperada <- dados_municipio$prod_maxima
+  sev_clima     <- dados_municipio$severidade_final_pct
+  
+  # Recálculo do dano real usando a fenologia personalizada do produtor
+  perda_real_kgha <- prod_esperada * (coef_c * (sev_clima / 100))
+  perda_sacas_ha  <- perda_real_kgha / 60
+  
+  # 4. Cálculo do Impacto Financeiro na Fazenda
+  prejuizo_financeiro_ha <- perda_sacas_ha * PRECO_SACA_SEGURO
+  reembolso_total_fazenda <- prejuizo_financeiro_ha * area_fazenda_ha
+  
+  # Retorna o laudo de sinistro estruturado
+  laudo <- data.frame(
+    `Município` = dados_municipio$name_muni,
+    `Área Segurada (ha)` = area_fazenda_ha,
+    `Fase da Infecção` = fenologia_na_infeccao,
+    `Prod. Esperada (kg/ha)` = round(prod_esperada, 0),
+    `Perda Ajustada (kg/ha)` = round(perda_real_kgha, 1),
+    `Perda por Hectare (R$/ha)` = round(prejuizo_financeiro_ha, 2),
+    `Reembolso Total (R$)` = round(reembolso_total_fazenda, 2),
+    check.names = FALSE
+  )
+  
+  return(laudo)
+}
+
+# ------------------------------------------------------------
+# EXERCÍCIO DE SIMULAÇÃO: Criando a Matriz de Casos Reais
+# ------------------------------------------------------------
+
+# Cenário: 3 produtores de 500 hectares em cidades diferentes, infectados em fases distintas
+laudo_produtor_A <- calcular_reembolso(municipio = "Unaí", area_fazenda_ha = 500, fenologia_na_infeccao = "Enchimento")
+laudo_produtor_B <- calcular_reembolso(municipio = "Uberaba", area_fazenda_ha = 500, fenologia_na_infeccao = "Vegetativo")
+laudo_produtor_C <- calcular_reembolso(municipio = "Patrocínio", area_fazenda_ha = 500, fenologia_na_infeccao = "Maturação")
+
+# Consolida os laudos em uma única matriz de consulta para a diretoria
+matriz_sinistros_regulados <- rbind(laudo_produtor_A, laudo_produtor_B, laudo_produtor_C)
+
+# Exibe a tabela de pagamentos formatada para o relatório
+knitr::kable(
+  matriz_sinistros_regulados, 
+  format.args = list(big.mark = ".", decimal.mark = ","),
+  caption = "Laudo de Regulação de Sinistros: Demonstrativo de Reembolso Personalizado por Fenologia e Localidade"
+)
+
+```
+
+# Aplicativo
+
+Endereço para entrar no aplicativo:
+
+XXXXXX
+
+Criamos um aplicativo interativo no qual é possível inserir os seguintes "inputs":
+
+-   Município de interesse;
+
+-   Estádio fenológico da cultura;
+
+-   Data de início da infecção;
+
+-   Área de plantio (ha)
+
+Retornando os "outputs":
+
+-   Análise de risco por município;
+
+-   Prejuízo estimado;
+
+-   Valor cobrado do seguro ao produtor (Prêmio);
+
+-   Valor a ser reembolsado ao produtor
+
+## Referências
+
+DALLA LANA, F.; GODOY, C. V.; STEWART, S.; KUNZ, C.; DIAS, M. D.; SIMON, J.; DEL PONTE, E. M.; PAUL, P. A. Meta-analysis of the relationship between crop yield and soybean rust severity. Phytopathology, v. 105, n. 3, p. 307-315, 2015.
+
+DEL PONTE, E. M.; GODOY, C. V.; LI, X.; YANG, X. B. Predicting soybean rust severity from cumulative rainfall. Phytopathology, v. 96, n. 2, p. 205-211, 2006.
