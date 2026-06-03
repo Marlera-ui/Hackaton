@@ -72,3 +72,4 @@ Observações de reprodutibilidade
 Os dados climáticos foram obtidos via API da NASA POWER para todos os municípios produtores de soja em MG, Safra 2023/2024 (novembro/2023 a fevereiro/2024).
 O arquivo mg_municipios.rds foi gerado com o pacote geobr (ano-base 2020) e salvo localmente para evitar dependência de conexão durante a execução do app.
 Os dados de produtividade são obtidos em tempo real via pacote sidrar (anos 2022, 2023 e 2024) — é necessária conexão com a internet para executar o app.
+
